@@ -61,32 +61,98 @@ async function handleTool(name, args) {
   }
 }
 
+// Sessões SSE ativas
+const sessions = new Map();
+
+function sendSSE(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-  if (req.method === "GET" && req.url === "/") { res.writeHead(200); res.end("Trello MCP Server running!"); return; }
-  if (req.method === "POST" && req.url === "/mcp") {
+
+  // Health check
+  if (req.method === "GET" && req.url === "/") {
+    res.writeHead(200); res.end("Trello MCP Server running!"); return;
+  }
+
+  // SSE endpoint — Claude conecta aqui primeiro
+  if (req.method === "GET" && req.url.startsWith("/sse")) {
+    const sessionId = crypto.randomUUID();
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no"
+    });
+
+    sessions.set(sessionId, res);
+
+    // Envia endpoint onde o Claude deve postar mensagens
+    const host = req.headers.host;
+    sendSSE(res, "endpoint", { uri: `https://${host}/messages?sessionId=${sessionId}` });
+
+    req.on("close", () => sessions.delete(sessionId));
+    return;
+  }
+
+  // Messages endpoint — Claude posta requisições MCP aqui
+  if (req.method === "POST" && req.url.startsWith("/messages")) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const sessionId = url.searchParams.get("sessionId");
+    const sseRes = sessions.get(sessionId);
+
     let body = "";
     req.on("data", chunk => body += chunk);
     req.on("end", async () => {
       try {
         const { id, method, params } = JSON.parse(body);
         let result;
-        if (method === "initialize") result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "trello-mcp", version: "1.0.0" } };
-        else if (method === "tools/list") result = { tools: TOOLS };
-        else if (method === "tools/call") result = { content: [{ type: "text", text: JSON.stringify(await handleTool(params.name, params.arguments || {}), null, 2) }] };
-        else result = {};
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id, result }));
+
+        if (method === "initialize") {
+          result = {
+            protocolVersion: "2024-11-05",
+            capabilities: { tools: {} },
+            serverInfo: { name: "trello-mcp", version: "1.0.0" }
+          };
+        } else if (method === "notifications/initialized") {
+          res.writeHead(202); res.end(); return;
+        } else if (method === "tools/list") {
+          result = { tools: TOOLS };
+        } else if (method === "tools/call") {
+          const output = await handleTool(params.name, params.arguments || {});
+          result = { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+        } else {
+          result = {};
+        }
+
+        const response = JSON.stringify({ jsonrpc: "2.0", id, result });
+
+        if (sseRes) {
+          sendSSE(sseRes, "message", JSON.parse(response));
+          res.writeHead(202); res.end();
+        } else {
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(response);
+        }
       } catch (err) {
-        res.writeHead(500, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: err.message } }));
+        const errResponse = JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: err.message } });
+        if (sseRes) {
+          sendSSE(sseRes, "message", JSON.parse(errResponse));
+          res.writeHead(202); res.end();
+        } else {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(errResponse);
+        }
       }
     });
     return;
   }
+
   res.writeHead(404); res.end("Not found");
 });
 
