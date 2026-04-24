@@ -20,11 +20,11 @@ async function trello(path, method = "GET") {
 
 const TOOLS = [
   { name: "trello_get_boards", description: "Lista todos os boards do usuário no Trello", inputSchema: { type: "object", properties: {} } },
-  { name: "trello_get_lists", description: "Lista todas as listas de um board", inputSchema: { type: "object", properties: { board_id: { type: "string" } }, required: ["board_id"] } },
+  { name: "trello_get_lists", description: "Lista todas as listas de um board", inputSchema: { type: "object", properties: { board_id: { type: "string", description: "ID do board" } }, required: ["board_id"] } },
   { name: "trello_get_cards", description: "Lista cards de um board ou lista", inputSchema: { type: "object", properties: { board_id: { type: "string" }, list_id: { type: "string" } } } },
   { name: "trello_create_card", description: "Cria um card em uma lista", inputSchema: { type: "object", properties: { list_id: { type: "string" }, name: { type: "string" }, desc: { type: "string" } }, required: ["list_id", "name"] } },
   { name: "trello_update_card", description: "Atualiza um card existente", inputSchema: { type: "object", properties: { card_id: { type: "string" }, name: { type: "string" }, desc: { type: "string" }, list_id: { type: "string" } }, required: ["card_id"] } },
-  { name: "trello_get_card_details", description: "Detalhes completos de um card com checklists e comentários", inputSchema: { type: "object", properties: { card_id: { type: "string" } }, required: ["card_id"] } },
+  { name: "trello_get_card_details", description: "Detalhes completos de um card", inputSchema: { type: "object", properties: { card_id: { type: "string" } }, required: ["card_id"] } },
   { name: "trello_add_comment", description: "Adiciona comentário a um card", inputSchema: { type: "object", properties: { card_id: { type: "string" }, text: { type: "string" } }, required: ["card_id", "text"] } }
 ];
 
@@ -39,9 +39,9 @@ async function handleTool(name, args) {
       if (args.list_id) return await trello(`/lists/${args.list_id}/cards?fields=id,name,desc,due,url,idList`);
       return await trello(`/boards/${args.board_id}/cards?fields=id,name,desc,due,url,idList`);
     case "trello_create_card": {
-      const params = new URLSearchParams({ idList: args.list_id, name: args.name });
-      if (args.desc) params.set("desc", args.desc);
-      return await trello(`/cards?${params}`, "POST");
+      const p = new URLSearchParams({ idList: args.list_id, name: args.name });
+      if (args.desc) p.set("desc", args.desc);
+      return await trello(`/cards?${p}`, "POST");
     }
     case "trello_update_card": {
       const { card_id, ...fields } = args;
@@ -61,96 +61,64 @@ async function handleTool(name, args) {
   }
 }
 
-// Sessões SSE ativas
-const sessions = new Map();
-
-function sendSSE(res, event, data) {
-  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
 const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Accept, Mcp-Session-Id");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+  if (req.method === "GET" && req.url === "/") { res.writeHead(200); res.end("Trello MCP Server running!"); return; }
 
-  // Health check
-  if (req.method === "GET" && req.url === "/") {
-    res.writeHead(200); res.end("Trello MCP Server running!"); return;
-  }
+  if (req.url === "/mcp") {
+    if (req.method === "POST") {
+      let body = "";
+      req.on("data", chunk => body += chunk);
+      req.on("end", async () => {
+        try {
+          const msg = JSON.parse(body);
+          const msgs = Array.isArray(msg) ? msg : [msg];
+          const responses = [];
 
-  // SSE endpoint — Claude conecta aqui primeiro
-  if (req.method === "GET" && req.url.startsWith("/sse")) {
-    const sessionId = crypto.randomUUID();
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
-      "X-Accel-Buffering": "no"
-    });
+          for (const { id, method, params } of msgs) {
+            let result;
+            if (method === "initialize") {
+              result = { protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "trello-mcp", version: "1.0.0" } };
+            } else if (method === "notifications/initialized" || method === "ping") {
+              continue;
+            } else if (method === "tools/list") {
+              result = { tools: TOOLS };
+            } else if (method === "tools/call") {
+              const output = await handleTool(params.name, params.arguments || {});
+              result = { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
+            } else {
+              result = {};
+            }
+            if (id !== undefined) responses.push({ jsonrpc: "2.0", id, result });
+          }
 
-    sessions.set(sessionId, res);
-
-    // Envia endpoint onde o Claude deve postar mensagens
-    const host = req.headers.host;
-    sendSSE(res, "endpoint", { uri: `https://${host}/messages?sessionId=${sessionId}` });
-
-    req.on("close", () => sessions.delete(sessionId));
-    return;
-  }
-
-  // Messages endpoint — Claude posta requisições MCP aqui
-  if (req.method === "POST" && req.url.startsWith("/messages")) {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const sessionId = url.searchParams.get("sessionId");
-    const sseRes = sessions.get(sessionId);
-
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
-      try {
-        const { id, method, params } = JSON.parse(body);
-        let result;
-
-        if (method === "initialize") {
-          result = {
-            protocolVersion: "2024-11-05",
-            capabilities: { tools: {} },
-            serverInfo: { name: "trello-mcp", version: "1.0.0" }
-          };
-        } else if (method === "notifications/initialized") {
-          res.writeHead(202); res.end(); return;
-        } else if (method === "tools/list") {
-          result = { tools: TOOLS };
-        } else if (method === "tools/call") {
-          const output = await handleTool(params.name, params.arguments || {});
-          result = { content: [{ type: "text", text: JSON.stringify(output, null, 2) }] };
-        } else {
-          result = {};
-        }
-
-        const response = JSON.stringify({ jsonrpc: "2.0", id, result });
-
-        if (sseRes) {
-          sendSSE(sseRes, "message", JSON.parse(response));
-          res.writeHead(202); res.end();
-        } else {
           res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(response);
-        }
-      } catch (err) {
-        const errResponse = JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: err.message } });
-        if (sseRes) {
-          sendSSE(sseRes, "message", JSON.parse(errResponse));
-          res.writeHead(202); res.end();
-        } else {
+          res.end(responses.length === 1 ? JSON.stringify(responses[0]) : JSON.stringify(responses));
+        } catch (err) {
           res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(errResponse);
+          res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: err.message } }));
         }
-      }
-    });
-    return;
+      });
+      return;
+    }
+
+    // GET /mcp — SSE stream para Streamable HTTP
+    if (req.method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+      });
+      res.write(": ping\n\n");
+      const interval = setInterval(() => res.write(": ping\n\n"), 15000);
+      req.on("close", () => clearInterval(interval));
+      return;
+    }
   }
 
   res.writeHead(404); res.end("Not found");
